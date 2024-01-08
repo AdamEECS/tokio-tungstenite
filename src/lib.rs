@@ -194,6 +194,11 @@ pub struct WebSocketStream<S> {
     inner: WebSocket<AllowStd<S>>,
     closing: bool,
     ended: bool,
+    /// Tungstenite is probably ready to receive more data.
+    ///
+    /// `false` once start_send hits `WouldBlock` errors.
+    /// `true` initially and after `flush`ing.
+    ready: bool,
 }
 
 impl<S> WebSocketStream<S> {
@@ -244,7 +249,7 @@ impl<S> WebSocketStream<S> {
     }
 
     pub(crate) fn new(ws: WebSocket<AllowStd<S>>) -> Self {
-        WebSocketStream { inner: ws, closing: false, ended: false }
+        Self { inner: ws, closing: false, ended: false, ready: true }
     }
 
     fn with_context<F, R>(&mut self, ctx: Option<(ContextWaker, &mut Context<'_>)>, f: F) -> R
@@ -308,8 +313,8 @@ where
         }
 
         match futures_util::ready!(self.with_context(Some((ContextWaker::Read, cx)), |s| {
-            trace!("{}:{} Stream.with_context poll_next -> read_message()", file!(), line!());
-            cvt(s.read_message())
+            trace!("{}:{} Stream.with_context poll_next -> read()", file!(), line!());
+            cvt(s.read())
         })) {
             Ok(v) => Poll::Ready(Some(Ok(v))),
             Err(e) => {
@@ -340,18 +345,31 @@ where
     type Error = WsError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        (*self).with_context(Some((ContextWaker::Write, cx)), |s| cvt(s.write_pending()))
+        if self.ready {
+            Poll::Ready(Ok(()))
+        } else {
+            // Currently blocked so try to flush the blockage away
+            (*self).with_context(Some((ContextWaker::Write, cx)), |s| cvt(s.flush())).map(|r| {
+                self.ready = true;
+                r
+            })
+        }
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-        match (*self).with_context(None, |s| s.write_message(item)) {
-            Ok(()) => Ok(()),
-            Err(::tungstenite::Error::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                // the message was accepted and queued
-                // isn't an error.
+        match (*self).with_context(None, |s| s.write(item)) {
+            Ok(()) => {
+                self.ready = true;
+                Ok(())
+            }
+            Err(WsError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                // the message was accepted and queued so not an error
+                // but `poll_ready` will now start trying to flush the block
+                self.ready = false;
                 Ok(())
             }
             Err(e) => {
+                self.ready = true;
                 debug!("websocket start_send error: {}", e);
                 Err(e)
             }
@@ -359,21 +377,29 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        (*self).with_context(Some((ContextWaker::Write, cx)), |s| cvt(s.write_pending()))
+        (*self).with_context(Some((ContextWaker::Write, cx)), |s| cvt(s.flush())).map(|r| {
+            self.ready = true;
+            match r {
+                // WebSocket connection has just been closed. Flushing completed, not an error.
+                Err(WsError::ConnectionClosed) => Ok(()),
+                other => other,
+            }
+        })
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.ready = true;
         let res = if self.closing {
-            // After queueing it, we call `write_pending` to drive the close handshake to completion.
-            (*self).with_context(Some((ContextWaker::Write, cx)), |s| s.write_pending())
+            // After queueing it, we call `flush` to drive the close handshake to completion.
+            (*self).with_context(Some((ContextWaker::Write, cx)), |s| s.flush())
         } else {
             (*self).with_context(Some((ContextWaker::Write, cx)), |s| s.close(None))
         };
 
         match res {
             Ok(()) => Poll::Ready(Ok(())),
-            Err(::tungstenite::Error::ConnectionClosed) => Poll::Ready(Ok(())),
-            Err(::tungstenite::Error::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(WsError::ConnectionClosed) => Poll::Ready(Ok(())),
+            Err(WsError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 trace!("WouldBlock");
                 self.closing = true;
                 Poll::Pending
@@ -391,6 +417,9 @@ where
 #[inline]
 fn domain(request: &tungstenite::handshake::client::Request) -> Result<String, WsError> {
     match request.uri().host() {
+        // rustls expects IPv6 addresses without the surrounding [] brackets
+        #[cfg(feature = "__rustls-tls")]
+        Some(d) if d.starts_with('[') && d.ends_with(']') => Ok(d[1..d.len() - 1].to_string()),
         Some(d) => Ok(d.to_string()),
         None => Err(WsError::Url(tungstenite::error::UrlError::NoHostName)),
     }
