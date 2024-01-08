@@ -1,3 +1,34 @@
+# 0.21.0
+
+- Update TLS dependencies.
+- Update `tungstenite` to `0.21.0`.
+
+# 0.20.1
+
+- Fix RUSTSEC-2023-0053.
+- Fix transitive CVE-2023-43669 from `tungstenite`.
+
+# 0.20.0
+
+- Change the buffering behavior for `Sink::send()` and `Sink::feed()`, [see `tungstenite`'s changelog for more details](https://github.com/snapview/tungstenite-rs/blob/master/CHANGELOG.md#0200).
+
+# 0.19.0
+
+- Allow users to enable/disable Nagle algorithm when using `connect()` helpers.
+- Improve the behavior of the `Sink` for the `WebSocketStream`, so it does not return an error when it’s not necessary (when `poll_flush()` is called on a connection that has just been closed).
+- Workaround an issue where `rustls` TLS backend expected domain in a certain format and reject IPv6 addresses if they contained square brackets in them.
+- Update dependencies and remove unused errors.
+
+# 0.18.0
+
+- Update dependencies (underlying `tungstenite` core).
+
+# 0.17.2
+
+- Make `Origin` header case-sensitive (to keep compatibility with poorely-written servers that don't accept lowercase `Origin` header).
+- Make semantics of the reading form the `WebSocketStream` more reasonable (return `None` instead of an error when the stream is normally closed).
+- Imrpove the way `poll_close()` works by properly driving the close of the stream till completion.
+
 # 0.17.1
 
 - Update the `tungstenite` dependency (fixes a panic in `tungstenite` and MSRV), see [`tungstenite`'s changelog for more details](https://github.com/snapview/tungstenite-rs/blob/master/CHANGELOG.md#0172).
